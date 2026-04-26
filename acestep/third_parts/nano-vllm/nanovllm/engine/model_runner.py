@@ -1,5 +1,5 @@
+import json
 import os
-import pickle
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -24,6 +24,60 @@ from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
 import socket
+
+
+def _encode_for_shm(items: list) -> bytes:
+    """Encode IPC arguments to UTF-8 JSON bytes for shared-memory transport.
+
+    Replaces ``pickle`` to avoid arbitrary code execution on deserialization.
+    Only the types that flow through the shared-memory IPC channel are
+    supported: ``str``, ``int``, ``float``, ``bool``, ``None``, ``list``, and
+    ``Sequence`` (serialised via its ``__getstate__`` tuple).
+
+    Args:
+        items: The flat list ``[method_name, *args]`` to encode.
+
+    Returns:
+        UTF-8 encoded JSON bytes.
+
+    Raises:
+        TypeError: If an unsupported type is encountered.
+    """
+    def _enc(obj):
+        if isinstance(obj, Sequence):
+            state = obj.__getstate__()
+            return {"__seq__": list(state)}
+        if isinstance(obj, list):
+            return [_enc(x) for x in obj]
+        if isinstance(obj, (str, int, float, bool)) or obj is None:
+            return obj
+        raise TypeError(f"Unsupported type for IPC serialization: {type(obj).__name__}")
+
+    return json.dumps([_enc(x) for x in items], separators=(",", ":")).encode("utf-8")
+
+
+def _decode_from_shm(data: bytes) -> list:
+    """Decode IPC arguments from UTF-8 JSON bytes produced by ``_encode_for_shm``.
+
+    Reconstructs ``Sequence`` objects from their serialised state without
+    invoking ``pickle.loads``, preventing arbitrary code execution.
+
+    Args:
+        data: Raw UTF-8 JSON bytes from shared memory.
+
+    Returns:
+        The decoded list ``[method_name, *args]``.
+    """
+    def _dec(obj):
+        if isinstance(obj, dict) and "__seq__" in obj:
+            seq = object.__new__(Sequence)
+            seq.__setstate__(tuple(obj["__seq__"]))
+            return seq
+        if isinstance(obj, list):
+            return [_dec(x) for x in obj]
+        return obj
+
+    return [_dec(x) for x in json.loads(data.decode("utf-8"))]
 
 
 def find_available_port(start_port: int = 2333, max_attempts: int = 100) -> int:
@@ -76,13 +130,21 @@ class ModelRunner:
         
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
+        
+        # Detect GPU compute capability to determine bfloat16 support
+        # Bfloat16 requires Ampere (compute capability >= 8.0) or newer
+        gpu_props = torch.cuda.get_device_properties(rank)
+        # Use tuple comparison to handle compute capability correctly
+        # (e.g., 7.5 < 8.0, 8.0 >= 8.0, 8.6 >= 8.0, etc.)
+        supports_bfloat16 = (gpu_props.major, gpu_props.minor) >= (8, 0)
+        
         # Use dtype instead of deprecated torch_dtype
         config_dtype = getattr(hf_config, 'dtype', getattr(hf_config, 'torch_dtype', torch.bfloat16))
 
         # Validate and convert config_dtype to a valid torch floating-point dtype
-        # Default to bfloat16 for CUDA (required for Flash Attention 2)
+        # Default to bfloat16 for CUDA (required for Flash Attention 2) if GPU supports it
         if config_dtype is None:
-            config_dtype = torch.bfloat16
+            config_dtype = torch.bfloat16 if supports_bfloat16 else torch.float16
         elif isinstance(config_dtype, str):
             # Convert string dtype to torch dtype
             dtype_map = {
@@ -95,10 +157,15 @@ class ModelRunner:
                 'torch.bfloat16': torch.bfloat16,
                 'torch.float64': torch.float64,
             }
-            config_dtype = dtype_map.get(config_dtype.lower(), torch.bfloat16)
+            config_dtype = dtype_map.get(config_dtype.lower(), torch.bfloat16 if supports_bfloat16 else torch.float16)
         elif not isinstance(config_dtype, torch.dtype) or not config_dtype.is_floating_point:
-            # If not a valid floating-point torch dtype, default to bfloat16
-            config_dtype = torch.bfloat16
+            # If not a valid floating-point torch dtype, default based on GPU capability
+            config_dtype = torch.bfloat16 if supports_bfloat16 else torch.float16
+        
+        # Override to float16 if config requested bfloat16 but GPU doesn't support it
+        if config_dtype == torch.bfloat16 and not supports_bfloat16:
+            print(f"[nanovllm] GPU {gpu_props.name} (compute capability {gpu_props.major}.{gpu_props.minor}) does not support bfloat16. Using float16 instead.", flush=True)
+            config_dtype = torch.float16
 
         self.dtype = config_dtype  # Save for later use
         torch.set_default_dtype(config_dtype)
@@ -187,13 +254,13 @@ class ModelRunner:
         assert self.world_size > 1 and self.rank > 0
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
-        method_name, *args = pickle.loads(self.shm.buf[4:n+4])
+        method_name, *args = _decode_from_shm(bytes(self.shm.buf[4:n+4]))
         self.event.clear()
         return method_name, args
 
     def write_shm(self, method_name, *args):
         assert self.world_size > 1 and self.rank == 0
-        data = pickle.dumps([method_name, *args])
+        data = _encode_for_shm([method_name, *args])
         n = len(data)
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data

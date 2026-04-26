@@ -68,6 +68,10 @@ class _DummyHandler:
         """Return simple debug payload."""
         return {}
 
+    def add_lora(self, lora_path, adapter_name=None):
+        """Forward to lifecycle implementation to mimic mixin wiring."""
+        return lifecycle.add_lora(self, lora_path, adapter_name=adapter_name)
+
 
 class LifecycleTests(unittest.TestCase):
     """Coverage for LoKr path detection and load branching."""
@@ -87,6 +91,21 @@ class LifecycleTests(unittest.TestCase):
             weights.write_bytes(b"")
             resolved = lifecycle._resolve_lokr_weights_path(str(weights))
             self.assertEqual(resolved, str(weights))
+
+    def test_resolve_lokr_weights_from_custom_safetensors_name(self):
+        """Directory should resolve custom LyCORIS safetensors filenames when metadata matches."""
+        with tempfile.TemporaryDirectory() as tmp:
+            adapter_dir = Path(tmp)
+            custom = adapter_dir / "custom_lycoris.safetensors"
+            custom.write_bytes(b"")
+
+            with patch(
+                "acestep.core.generation.handler.lora.lifecycle._is_lokr_safetensors",
+                side_effect=lambda path: path == str(custom),
+            ):
+                resolved = lifecycle._resolve_lokr_weights_path(str(adapter_dir))
+
+        self.assertEqual(resolved, str(custom))
 
     def test_load_lora_accepts_lokr_directory_without_adapter_config(self):
         """LoKr directory should bypass PEFT config-file requirement."""
@@ -109,6 +128,51 @@ class LifecycleTests(unittest.TestCase):
             message = lifecycle.load_lora(handler, tmp)
         self.assertIn("adapter_config.json", message)
         self.assertIn(lifecycle.LOKR_WEIGHTS_FILENAME, message)
+
+    def test_validate_peft_adapter_config_missing_peft_type(self):
+        """adapter_config.json without peft_type should return a clear error message."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_file = Path(tmp) / "adapter_config.json"
+            config_file.write_text('{"r": 16, "lora_alpha": 32}', encoding="utf-8")
+            error = lifecycle._validate_peft_adapter_config(str(config_file))
+        self.assertIsNotNone(error)
+        self.assertIn("peft_type", error)
+        self.assertIn("adapter_config.json", error)
+
+    def test_validate_peft_adapter_config_valid(self):
+        """adapter_config.json with peft_type present should return None."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_file = Path(tmp) / "adapter_config.json"
+            config_file.write_text('{"peft_type": "LORA", "r": 16}', encoding="utf-8")
+            error = lifecycle._validate_peft_adapter_config(str(config_file))
+        self.assertIsNone(error)
+
+    def test_validate_peft_adapter_config_invalid_json(self):
+        """Malformed adapter_config.json should return a parse-error message."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_file = Path(tmp) / "adapter_config.json"
+            config_file.write_text("{not valid json}", encoding="utf-8")
+            error = lifecycle._validate_peft_adapter_config(str(config_file))
+        self.assertIsNotNone(error)
+        self.assertIn("adapter_config.json", error)
+
+    def test_validate_peft_adapter_config_not_a_dict(self):
+        """adapter_config.json that is a non-object JSON value should return an error."""
+        with tempfile.TemporaryDirectory() as tmp:
+            config_file = Path(tmp) / "adapter_config.json"
+            config_file.write_text("[1, 2, 3]", encoding="utf-8")
+            error = lifecycle._validate_peft_adapter_config(str(config_file))
+        self.assertIsNotNone(error)
+
+    def test_add_lora_returns_clear_error_when_peft_type_missing(self):
+        """add_lora should return a descriptive error when adapter_config.json lacks peft_type."""
+        handler = _DummyHandler()
+        with tempfile.TemporaryDirectory() as tmp:
+            config_file = Path(tmp) / "adapter_config.json"
+            config_file.write_text('{"r": 16, "lora_alpha": 32}', encoding="utf-8")
+            message = lifecycle.add_lora(handler, tmp)
+        self.assertTrue(message.startswith("❌"))
+        self.assertIn("peft_type", message)
 
     def test_load_lokr_adapter_recreates_with_dora_when_weight_decompose_enabled(self):
         """Weight-decompose config should request a second LyCORIS net with DoRA enabled."""
