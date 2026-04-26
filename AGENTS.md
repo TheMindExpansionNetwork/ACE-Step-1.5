@@ -6,15 +6,30 @@ This document is aligned with the intent from:
 - Discussion #408: functional decomposition to reduce risk from large mixed-responsibility files.
 - Discussion #365: low-risk contribution workflow, minimal scope, and review rigor.
 
+## Jimsky Fork Context
+
+This checkout is the Jimsky / The Mind Expansion Network fork of ACE-Step 1.5.
+
+- Fork/origin: `https://github.com/TheMindExpansionNetwork/ACE-Step-1.5`
+- Upstream: `https://github.com/ace-step/ACE-Step-1.5`
+- Local path: `/opt/data/workspace/projects/ACE-Step-1.5`
+- Fork strategy note: `docs/JIMSKY_FORK_STRATEGY.md`
+
+Keep upstream attribution and license intact. Jimsky-specific work should be clearly labeled as wrappers, workbench/deployment layers, experiments, portfolio demos, or docs.
+
 ## Primary Objectives
 
 1. Keep changes safe and reviewable.
 2. Prefer small, maintainable, decomposed modules.
 3. Preserve behavior outside the target fix.
 4. Validate with focused Python unit tests.
+5. Maintain a clean upstream path: fetch from `upstream`, develop against `origin`, and sync with dedicated `vendor-sync/*` branches when upstream changes are large.
 
 ## Scope and Change Control (Required)
 
+- Preserve upstream attribution, license text, and original project references.
+- Do not commit model weights, generated audio batches, `.env`, credentials, API keys, SSH keys, tokens, or private deployment data.
+- Jimsky-specific deployment/portfolio work should live in clearly named docs/scripts/modules instead of being hidden inside upstream internals.
 - Solve one problem per task/PR.
 - Keep edits minimal: touch only files/functions required for the requested change.
 - Do not make drive-by refactors, formatting sweeps, or opportunistic cleanups.
